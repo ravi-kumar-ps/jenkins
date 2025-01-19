@@ -1,0 +1,49 @@
+pipeline {
+  agent any
+  options { timestamps () }
+  tools {
+        // Install the Maven version configured as "Maven3" and add it to the path.
+        maven "Maven3"
+    }
+
+    stages {
+      
+      // Stage 1
+      stage('Checkout SourceCode') {
+            steps {
+                // Get some code from a GitHub repository
+                   git  branch: 'master', credentialsId: 'newgithub', url: 'https://github.com/xxx/FCM-2.0.git'
+                // Run Maven on a Unix agent.
+                   sh "mvn -Dmaven.test.failure.ignore=true clean package"
+
+          }
+        }
+              
+
+      //  Stage 2
+       stage('Code Quality Check via SonarQube') {
+             steps {
+                 script {
+                      def scannerHome = tool 'sonarqube';
+                      withSonarQubeEnv("Sonar") {
+                      sh "${tool("sonarqube")}/bin/sonar-scanner \
+                      -Dsonar.projectKey=${JOB_NAME} \
+                      -Dsonar.sources=${WORKSPACE} \
+                      -Dsonar.java.binaries=${WORKSPACE}/target \
+                      -Dsonar.host.url=http://x.x.x.x:9099"
+          
+                         }
+                       }
+                     }
+           }
+
+       }
+  
+       // Post Stage
+     post {
+        always {     
+            emailext attachLog: true, body: '''$DEFAULT_CONTENT
+The Pipeline is ${CAUSE} to deploy the $JOB_NAME ''', replyTo: '$DEFAULT_RECIPIENTS', subject: '$DEFAULT_SUBJECT', recipientProviders: [developers(), requestor()], to: '$DEFAULT_RECIPIENTS'
+        }
+    }
+}
