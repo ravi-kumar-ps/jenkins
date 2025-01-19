@@ -1,0 +1,129 @@
+pipeline {
+    agent any
+    options { timestamps () }
+    tools {
+        nodejs "nodejs-old"
+    }
+    environment {
+        DOCKER_REGISTORY = 'x.x.x.x:5000'
+        CONFIG_PATH  = "/app-prod/central/${ENV}/web"
+        JAVA_8_HOME = '/usr/lib/jvm/adoptopenjdk-8-hotspot-amd64'
+        PROJECT_FOLDER = 'FKIntranet-Web'
+        TAR_FILE_NAME = 'fkintranet-web-0.1-SNAPSHOT.tgz'
+        DOCKER_IMAGE_NAME = "central/web-${ENV}"
+        DOCKER_CONTAINER_NAME = "central_web-${ENV}"
+        DOCKER_PORT = '9000:9000'
+        VOLUME_MOUNT = '/apps/logs'
+        def BUILD_ID = sh(script: "echo `date +%s`", returnStdout: true).trim()
+    }
+    stages {
+        stage("Pull Code") {
+            steps {
+              git branch: 'master', credentialsId: 'gitlabid', url: 'https://github.xxx.com/xxx/FK-Intranet.git'
+            }
+        }
+         stage("Create Build") {
+            steps {
+               sh "cp ${CONFIG_PATH}/ui/index.scala.html ${WORKSPACE}/${PROJECT_FOLDER}/app/views/index.scala.html"
+               sh "cp ${CONFIG_PATH}/ui/environment.prod.ts ${WORKSPACE}/${PROJECT_FOLDER}/ui/src/environments/environment.production.ts"
+               sh "cp ${CONFIG_PATH}/ui/environment.prod.ts ${WORKSPACE}/${PROJECT_FOLDER}/ui/src/environments/environment.ts"
+
+               dir("${PROJECT_FOLDER}"){
+                  sh "sbt -java-home ${JAVA_8_HOME} clean"
+               }
+               dir("${PROJECT_FOLDER}/ui/"){
+                  sh 'npm install'
+                  sh "ng build --aot --output-hashing none --output-path ../public/ui --configuration=production"
+               }
+               dir("${PROJECT_FOLDER}"){
+                  sh "sbt -java-home ${JAVA_8_HOME} universal:packageZipTarball"
+               }
+            }
+        }
+        stage("Unzip Build") {
+            steps {
+               dir("${PROJECT_FOLDER}/target/universal"){
+                  sh "tar zxvf ${TAR_FILE_NAME}"
+               }
+            }
+        }
+         stage("Copy Resources") {
+            steps {
+               dir("${PROJECT_FOLDER}/target"){
+                  sh "mkdir -p props"
+                  sh "chmod -R 777 props"
+               }
+               sh "cp -r ${CONFIG_PATH}/Articles ${WORKSPACE}/${PROJECT_FOLDER}/target/props"
+
+               dir("${CONFIG_PATH}/"){
+                 fileOperations([fileCopyOperation(excludes: '', flattenFiles: false, includes: '*', targetLocation: "${WORKSPACE}/${PROJECT_FOLDER}/target/props/")])
+                }
+               dir("${CONFIG_PATH}/"){
+                 fileOperations([folderCopyOperation(sourceFolderPath: 'sso', destinationFolderPath: "${WORKSPACE}/${PROJECT_FOLDER}/target/props/sso")])
+               }
+            }
+        }
+        stage("Build image") {
+            steps {
+             dir("${PROJECT_FOLDER}"){
+                sh "docker build -t ${DOCKER_IMAGE_NAME} ."
+                sh "docker tag ${DOCKER_IMAGE_NAME} ${DOCKER_REGISTORY}/${DOCKER_IMAGE_NAME}:latest"
+              }
+            }
+        }
+         stage("Push image") {
+            steps {
+                 sh "docker push ${DOCKER_REGISTORY}/${DOCKER_IMAGE_NAME}:latest"
+                 sh "docker rmi ${DOCKER_REGISTORY}/${DOCKER_IMAGE_NAME}:latest"
+                script {
+                    try {
+                        sh "docker rmi \$(docker images -f \"dangling=true\" -q)"
+                    } catch (Exception e) {
+                    }
+                    }
+                }
+
+        }
+        stage("Deploy") {
+        steps {
+            script {
+                def SERVERS = DEPLOY_SERVER.split(',')
+                 for(int i=0; i < SERVERS.size(); i++) {
+                    stage("Deploying On ${SERVERS[i].substring(SERVERS[i].lastIndexOf('@') + 1, SERVERS[i].length())}") {
+                            script {
+                            try {
+                                sh "ssh ${SERVERS[i]} docker stop ${DOCKER_CONTAINER_NAME}"
+                            } catch (Exception e) {
+                            }
+                            try {
+                                sh "ssh ${SERVERS[i]} docker rm ${DOCKER_CONTAINER_NAME}"
+                            } catch (Exception e) {
+                            }
+                            try {
+                                sh "ssh ${SERVERS[i]} docker image prune -a -f"
+                            } catch (Exception e) {
+                            }
+                            try {
+                                sh "ssh ${SERVERS[i]} docker volume prune -f"
+                            } catch (Exception e) {
+                            }
+
+                            }
+                            
+                            sh "ssh ${SERVERS[i]} docker pull ${DOCKER_REGISTORY}/${DOCKER_IMAGE_NAME}:latest"
+                            sh "ssh ${SERVERS[i]} docker run -d -p ${DOCKER_PORT} --name ${DOCKER_CONTAINER_NAME} --volume ${DOCKER_CONTAINER_NAME}_v:${VOLUME_MOUNT} --mount type=bind,source=/policies,target=/policies --env BUILD_ID=${BUILD_ID} ${DOCKER_REGISTORY}/${DOCKER_IMAGE_NAME}"
+
+                    }
+                 }
+            }
+           
+        }
+    }
+    }
+post {
+          always {     
+             emailext attachLog: true, body: '''$DEFAULT_CONTENT
+The Pipeline is ${CAUSE} to deploy the $JOB_NAME ''', replyTo: '$DEFAULT_RECIPIENTS', subject: '$DEFAULT_SUBJECT', recipientProviders: [developers(), requestor()], to: '$DEFAULT_RECIPIENTS'
+        }
+      }
+}
