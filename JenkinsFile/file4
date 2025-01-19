@@ -1,0 +1,95 @@
+pipeline { 
+   agent any
+   options { timestamps () }
+    tools {
+        maven "M3"
+        jdk "openjdk-8"
+    }
+    environment {
+        DOCKER_REGISTORY = 'x.x.x.x:5000'
+        DOCKER_IMAGE_NAME = 'data_sync'
+        DOCKER_CONTAINER_NAME = 'data_sync'
+        DOCKER_PORT = '8080:8080'
+        VOLUME_MOUNT = '/apps/logs'
+        LOG_PATH = '/apps/logs/'
+        KEY = 'corp'
+    }
+    stages {
+        stage("Pull Code") {
+            steps {
+                git branch: 'master', credentialsId: 'gitlabid', url: 'https://github.xxx.com/xxx/corp-engg-batch-processor.git'
+            }
+        }
+        stage("Create Build") {
+            steps {
+                sh "rm -rf src/main/resources/application-prod.properties"
+                sh "cp -r /application/data_sync/prod/application-prod.properties src/main/resources/application-prod.properties"
+                sh "mvn clean install package"
+            }
+        }
+        stage("Build image") {
+            steps {
+                sh "docker build -t ${DOCKER_IMAGE_NAME} ."
+                sh "docker tag ${DOCKER_IMAGE_NAME} ${DOCKER_REGISTORY}/${ENVIRONMENT}-${DOCKER_IMAGE_NAME}:latest"
+            }
+        }
+        stage("Push image") {
+            steps {
+                sh "docker push ${DOCKER_REGISTORY}/${ENVIRONMENT}-${DOCKER_IMAGE_NAME}:latest"
+                sh "docker rmi ${DOCKER_REGISTORY}/${ENVIRONMENT}-${DOCKER_IMAGE_NAME}:latest"
+                script {
+                    try {
+                        sh "docker rmi \$(docker images -f \"dangling=true\" -q)"
+                    } catch (Exception e) {
+                        echo 'Exception occurred: ' + e.toString()
+                    }
+                }
+            }
+
+        }
+        stage("Deploy") {
+            steps {
+                script {
+                    def SERVERS = DEPLOY_SERVER.split(',')
+                    for(int i=0; i < SERVERS.size(); i++) {
+                        stage("Deploying On ${SERVERS[i].substring(SERVERS[i].lastIndexOf('@') + 1, SERVERS[i].length())}") {
+                            script {
+                                try {
+                                    sh "ssh ${SERVERS[i]} docker stop ${DOCKER_CONTAINER_NAME}"
+                                } catch (Exception e) {
+                                    echo 'Exception occurred: ' + e.toString()
+                                }
+                                try {
+                                    sh "ssh ${SERVERS[i]} docker rm ${DOCKER_CONTAINER_NAME}"
+                                } catch (Exception e) {
+                                    echo 'Exception occurred: ' + e.toString()
+                                }
+                                try {
+                                    sh "ssh ${SERVERS[i]} docker image prune -a -f"
+                                } catch (Exception e) {
+                                    echo 'Exception occurred: ' + e.toString()
+                                }
+                                try {
+                                    sh "ssh ${SERVERS[i]} docker volume prune -f"
+                                } catch (Exception e) {
+                                    echo 'Exception occurred: ' + e.toString()
+                                }
+                            }
+
+                            sh "ssh ${SERVERS[i]} docker pull ${DOCKER_REGISTORY}/${ENVIRONMENT}-${DOCKER_IMAGE_NAME}:latest"
+                            sh "ssh ${SERVERS[i]} docker run -d -p ${DOCKER_PORT} -e env=${ENVIRONMENT} -e key=${KEY} -e boot=${BOOT} --name ${DOCKER_CONTAINER_NAME} --volume ${VOLUME_MOUNT}:${LOG_PATH} ${DOCKER_REGISTORY}/${ENVIRONMENT}-${DOCKER_IMAGE_NAME}"
+
+                        }
+                    }
+                }
+
+            }
+        }
+    }
+post {
+          always {
+             emailext attachLog: true, body: '''$DEFAULT_CONTENT
+The Pipeline is ${CAUSE} to deploy the $JOB_NAME ''', replyTo: '$DEFAULT_RECIPIENTS', subject: '$DEFAULT_SUBJECT', recipientProviders: [developers(), requestor()], to: '$DEFAULT_RECIPIENTS'
+        }
+      }
+}
